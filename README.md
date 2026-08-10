@@ -28,8 +28,7 @@ hosting needed):
 3. Go to **Settings → User Utilities → Plex Library Refresh**.
 
 **Alternative:** use the Plugins tab's **Install Plugin** URL field, if
-you host the `.plg` somewhere fetchable over HTTP (e.g. a GitHub repo's
-raw file URL).
+you host the `.plg` somewhere fetchable over HTTP.
 
 ## Configuring
 
