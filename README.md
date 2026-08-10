@@ -127,26 +127,5 @@ rm -rf /boot/config/plugins/plexlibraryrefresh /var/lib/plexlibraryrefresh
 - The main ongoing cost is inherent to polling: each check walks a
   watched directory's file tree. For a very large library, raising the
   poll interval reduces this directly.
-
-## Troubleshooting
-
-- **Refresh reports success but content doesn't show up in Plex.** The
-  path sent to Plex doesn't match anything in that library's own
-  configuration - almost always means the "Plex's own path" field (see
-  Configuring, step 3) needs to be set or corrected. Use Test connection
-  to see Plex's actual configured path(s).
-- **"Connected. 0 libraries found."** - the token/URL work, but that
-  token doesn't have access to any libraries (e.g. a limited user's
-  token rather than the server owner's).
-- **Refresh never fires.** Check Recent activity for "Change detected"
-  lines - if none appear, the daemon isn't seeing changes in that path
-  (typo, or a permissions issue). If changes are detected but no refresh
-  follows, re-check the Plex URL/token via Test connection.
-- **Daemon shows "stopped" after install.** Check
-  `/var/lib/plexlibraryrefresh/monitor_stdout.log` for a startup error,
-  or run `/etc/rc.d/rc.plexlibraryrefresh start` via SSH to see the
-  output directly.
-- **Live log while testing:**
-  ```bash
   tail -f /var/log/syslog | grep plexlibraryrefresh
   ```
