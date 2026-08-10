@@ -1,0 +1,93 @@
+#!/bin/bash
+#
+# Plex Media Server Library Refresh - service control script
+# Usage: rc.plexlibraryrefresh {start|stop|restart|status}
+
+# Web-server-invoked processes (PHP's shell_exec/exec) often run with a much
+# more restricted PATH than an interactive SSH session - bare commands like
+# pgrep/xargs/nohup can silently fail to be found otherwise. Make sure the
+# standard locations are always searched regardless of the caller's PATH.
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+
+DAEMON="/usr/local/emhttp/plugins/plexlibraryrefresh/scripts/monitor.sh"
+STATE_DIR="/var/lib/plexlibraryrefresh"
+PID_FILE="$STATE_DIR/monitor.pid"
+
+mkdir -p "$STATE_DIR"
+
+# Matches on the actual command line, not just a PID number, so a stale PID
+# file pointing at a since-reused PID (e.g. after a plugin reinstall killed
+# the daemon without updating the PID file) is never mistaken for "running".
+#
+# The pattern brackets one character ([m]onitor.sh rather than
+# monitor.sh) - a standard trick to stop pgrep -f from matching its own
+# invocation. Without it, pgrep matches ANY process whose command line
+# contains the search text, which includes the shell wrapper PHP/this
+# script itself spawns to run pgrep - a confirmed false positive that
+# made the daemon appear permanently "running" regardless of its real
+# state.
+DAEMON_PATTERN="/usr/local/emhttp/plugins/plexlibraryrefresh/scripts/[m]onitor.sh"
+
+pids_running() {
+    pgrep -f "$DAEMON_PATTERN" 2>/dev/null
+}
+
+is_running() {
+    [ -n "$(pids_running)" ]
+}
+
+start() {
+    if is_running; then
+        echo "Already running (pid(s): $(pids_running | tr '\n' ' '))."
+        return 0
+    fi
+    nohup "$DAEMON" >> "$STATE_DIR/monitor_stdout.log" 2>&1 &
+    disown
+    sleep 1
+    if is_running; then
+        echo "Started (pid $(pids_running | tr '\n' ' '))."
+    else
+        echo "Failed to start - check $STATE_DIR/monitor_stdout.log"
+        return 1
+    fi
+}
+
+stop() {
+    local pids
+    pids="$(pids_running)"
+    if [ -z "$pids" ]; then
+        echo "Not running."
+        rm -f "$PID_FILE"
+        return 0
+    fi
+    # Kill EVERY matching process, not just the one in the PID file - if a
+    # previous stop was silently blocked (e.g. by the CSRF bug in an
+    # earlier version), more than one instance may be running.
+    echo "$pids" | xargs -r kill 2>/dev/null
+    for _ in $(seq 1 10); do
+        is_running || break
+        sleep 0.5
+    done
+    if is_running; then
+        echo "$(pids_running)" | xargs -r kill -9 2>/dev/null
+    fi
+    rm -f "$PID_FILE"
+    echo "Stopped."
+}
+
+case "${1:-}" in
+    start) start ;;
+    stop) stop ;;
+    restart) stop; start ;;
+    status)
+        if is_running; then
+            echo "Running (pid(s): $(pids_running | tr '\n' ' '))."
+        else
+            echo "Stopped."
+        fi
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status}"
+        exit 1
+        ;;
+esac

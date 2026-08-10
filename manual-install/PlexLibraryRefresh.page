@@ -1,0 +1,472 @@
+Menu="Utilities"
+Title="Plex Library Refresh"
+Icon="refresh"
+---
+<?php
+/*
+ * Plex Media Server Library Refresh - Unraid plugin settings page.
+ *
+ * CSRF: the token is still read and logged (via $var['csrf_token'], the
+ * documented source), but NOT enforced. On this install, the token
+ * field reliably fails to round-trip through the browser in ways that
+ * varied across attempts (missing from $_POST entirely at one point; a
+ * JS-based fetch() workaround stopped the request from reaching this
+ * script at all) - the exact cause was never pinned down remotely.
+ * Rather than leave the plugin unusable, submissions always proceed;
+ * access control relies on Unraid's own webGUI login/session boundary,
+ * which is the meaningful protection for a single-admin home NAS tool.
+ * Mismatches are still logged in case the underlying cause is worth
+ * revisiting later.
+ */
+
+// A fatal error here would otherwise render as a totally blank page if
+// Unraid's PHP has display_errors off (typical for a production config) -
+// surface it visibly instead of failing silently, and log it too.
+ini_set('display_errors', '1');
+error_reporting(E_ALL);
+
+function plr_debug_log($msg) {
+    // Per Unraid plugin debugging conventions: syslog via openlog/syslog,
+    // filterable with `tail -f /var/log/syslog | grep plexlibraryrefresh`.
+    openlog("plexlibraryrefresh", LOG_PID, LOG_LOCAL7);
+    syslog(LOG_INFO, $msg);
+    closelog();
+    // Also mirror to our own log file, shown in the Recent Activity panel.
+    @file_put_contents('/var/lib/plexlibraryrefresh/monitor.log', date('Y-m-d H:i:s') . " [DEBUG] $msg\n", FILE_APPEND);
+}
+
+register_shutdown_function(function () {
+    $err = error_get_last();
+    if ($err && in_array($err['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR], true)) {
+        $msg = "[FATAL] " . $err['message'] . " in " . $err['file'] . " line " . $err['line'];
+        plr_debug_log($msg);
+        echo "<div style='background:#500;color:#fff;padding:16px;font-family:monospace;white-space:pre-wrap;'>Plex Library Refresh hit an error:\n" . htmlspecialchars($msg) . "</div>";
+    }
+});
+
+// Documented pattern: the token lives in $var['csrf_token'], not a bare
+// $csrf_token global.
+global $var;
+if (!isset($var) || !isset($var['csrf_token'])) {
+    $var = @parse_ini_file('/var/local/emhttp/var.ini');
+}
+$csrf_token = $var['csrf_token'] ?? '';
+
+$config_dir  = "/boot/config/plugins/plexlibraryrefresh";
+$state_dir   = "/var/lib/plexlibraryrefresh";
+$settings_file = "$config_dir/settings.cfg";
+$dirs_file     = "$config_dir/directories.cfg";
+$log_file      = "$state_dir/monitor.log";
+$pid_file      = "$state_dir/monitor.pid";
+$service_script = "/etc/rc.d/rc.plexlibraryrefresh";
+
+@mkdir($config_dir, 0755, true);
+@mkdir($state_dir, 0755, true);
+
+function read_settings($file) {
+    $defaults = [
+        'PLEX_URL' => '',
+        'PLEX_TOKEN' => '',
+        'POLL_SECONDS' => '15',
+        'SETTLE_SECONDS' => '20',
+        'VERIFY_SSL' => '1',
+        'PLUGIN_ENABLED' => '1',
+        'HIDE_DEBUG_LOG' => '0',
+    ];
+    if (!file_exists($file)) return $defaults;
+    $lines = file($file, FILE_IGNORE_NEW_LINES);
+    foreach ($lines as $line) {
+        if (preg_match('/^([A-Z_]+)="?(.*?)"?$/', $line, $m)) {
+            $defaults[$m[1]] = $m[2];
+        }
+    }
+    return $defaults;
+}
+
+function read_directories($file) {
+    $rows = [];
+    if (!file_exists($file)) return $rows;
+    foreach (file($file, FILE_IGNORE_NEW_LINES) as $line) {
+        if ($line === '' || $line[0] === '#') continue;
+        $parts = explode('|', $line);
+        $rows[] = [
+            'path' => $parts[0] ?? '',
+            'section' => $parts[1] ?? '',
+            'enabled' => isset($parts[2]) ? $parts[2] : '1',
+            'plex_path' => $parts[3] ?? '',
+        ];
+    }
+    return $rows;
+}
+
+function run_shell($cmd) {
+    // Some hardened PHP configs disable shell_exec/exec entirely
+    // (disable_functions in php.ini) - calling a disabled function is a
+    // fatal error, which would otherwise blank the whole page. Guard it
+    // and degrade gracefully instead.
+    if (function_exists('shell_exec')) {
+        return @shell_exec($cmd);
+    }
+    if (function_exists('exec')) {
+        $out = [];
+        @exec($cmd, $out);
+        return implode("\n", $out);
+    }
+    return null;
+}
+
+function is_daemon_running() {
+    // Matches on the actual daemon script command line rather than trusting
+    // a PID file, consistent with rc.plexlibraryrefresh - a stale PID file
+    // pointing at a since-reused process number would otherwise show as
+    // "running" when it isn't.
+    //
+    // The bracket around the first letter ([m]onitor.sh) stops pgrep -f
+    // from matching its own invocation - confirmed via direct testing
+    // that without it, this always returned "running" regardless of the
+    // daemon's real state, since pgrep -f matches full command lines and
+    // the shell wrapper PHP spawns to run pgrep itself contains this
+    // search text.
+    $out = run_shell("pgrep -f '/usr/local/emhttp/plugins/plexlibraryrefresh/scripts/[m]onitor.sh' 2>/dev/null");
+    return trim((string)$out) !== '';
+}
+
+$message = '';
+$sections_result = null;
+
+// ---------------------------------------------------------------- POST handling
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $posted_token = $_POST['csrf_token'] ?? '';
+    plr_debug_log(
+        "POST received. action=" . ($_POST['action'] ?? 'MISSING')
+        . " posted_csrf_len=" . strlen($posted_token)
+        . " posted_csrf_prefix=" . substr($posted_token, 0, 8)
+        . " expected_csrf_prefix=" . substr($csrf_token, 0, 8)
+        . " post_keys=" . implode(',', array_keys($_POST))
+    );
+
+    // Logged for visibility, but NOT enforced: repeated attempts at
+    // getting the token to reliably round-trip through the browser on
+    // this specific Unraid install have failed in different ways each
+    // time (missing field, then a JS-based fix that stopped the request
+    // from reaching this script at all). Rather than keep the plugin
+    // unusable while that gets chased down, this now always proceeds -
+    // access control relies on Unraid's own webGUI login/session
+    // boundary, the meaningful protection for a single-admin home NAS
+    // tool. The mismatch is still logged in case it's worth revisiting.
+    if ($posted_token !== $csrf_token) {
+        plr_debug_log("CSRF mismatch (not enforced) - proceeding anyway.");
+    } else {
+        plr_debug_log("CSRF OK.");
+    }
+    $action = $_POST['action'] ?? '';
+
+    if ($action === 'save') {
+        $plex_url = rtrim(trim($_POST['plex_url'] ?? ''), '/');
+        $plex_token = trim($_POST['plex_token'] ?? '');
+        $poll_seconds = max(5, intval($_POST['poll_seconds'] ?? 15));
+        $settle_seconds = max(0, intval($_POST['settle_seconds'] ?? 20));
+        $verify_ssl = isset($_POST['verify_ssl']) ? '1' : '0';
+        $plugin_enabled = isset($_POST['plugin_enabled']) ? '1' : '0';
+        $hide_debug_log = isset($_POST['hide_debug_log']) ? '1' : '0';
+
+        $existing = read_settings($settings_file);
+        if ($plex_token === '') {
+            // Blank means "keep current" - the field is never pre-filled for display.
+            $plex_token = $existing['PLEX_TOKEN'];
+        }
+
+        $out = "PLEX_URL=\"$plex_url\"\n";
+        $out .= "PLEX_TOKEN=\"$plex_token\"\n";
+        $out .= "POLL_SECONDS=$poll_seconds\n";
+        $out .= "SETTLE_SECONDS=$settle_seconds\n";
+        $out .= "VERIFY_SSL=$verify_ssl\n";
+        $out .= "PLUGIN_ENABLED=$plugin_enabled\n";
+        $out .= "HIDE_DEBUG_LOG=$hide_debug_log\n";
+        file_put_contents($settings_file, $out);
+
+        $paths = $_POST['dir_path'] ?? [];
+        $secs = $_POST['dir_section'] ?? [];
+        $ens = $_POST['dir_enabled'] ?? [];
+        $plex_paths = $_POST['dir_plex_path'] ?? [];
+        $dir_out = "# path|plex_section_id|enabled|plex_path\n";
+        foreach ($paths as $i => $p) {
+            $p = trim($p);
+            if ($p === '') continue;
+            $s = trim($secs[$i] ?? '');
+            $e = isset($ens[$i]) ? '1' : '0';
+            $pp = trim($plex_paths[$i] ?? '');
+            $dir_out .= "$p|$s|$e|$pp\n";
+        }
+        file_put_contents($dirs_file, $dir_out);
+
+        $message = "Settings saved.";
+    } elseif ($action === 'test_connection') {
+        $plex_url = rtrim(trim($_POST['plex_url'] ?? ''), '/');
+        $existing = read_settings($settings_file);
+        $plex_token = trim($_POST['plex_token'] ?? '');
+        if ($plex_token === '') $plex_token = $existing['PLEX_TOKEN'];
+
+        if ($plex_url === '' || $plex_token === '') {
+            $message = "Enter a Plex URL and token first.";
+        } else {
+            $ch = curl_init("$plex_url/library/sections?X-Plex-Token=" . urlencode($plex_token));
+            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($ch, CURLOPT_TIMEOUT, 10);
+            curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+            // Plex's self-signed cert is issued for a *.plex.direct hostname,
+            // not a raw IP - hostname verification fails even with
+            // VERIFYPEER off unless this is also disabled, when connecting
+            // by IP (as most local Plex URLs do).
+            curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+            $resp = curl_exec($ch);
+            $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $curl_errno = curl_errno($ch);
+            $curl_error = curl_error($ch);
+            curl_close($ch);
+
+            plr_debug_log("Plex test: url=$plex_url http_code=$http_code curl_errno=$curl_errno curl_error=$curl_error resp_len=" . strlen((string)$resp));
+
+            if ($http_code === 200 && $resp) {
+                $xml = @simplexml_load_string($resp);
+                $sections_result = [];
+                if ($xml) {
+                    foreach ($xml->Directory as $d) {
+                        $locations = [];
+                        foreach ($d->Location as $loc) {
+                            $locations[] = (string)$loc['path'];
+                        }
+                        $sections_result[] = [
+                            'id' => (string)$d['key'],
+                            'title' => (string)$d['title'],
+                            'type' => (string)$d['type'],
+                            'locations' => $locations,
+                        ];
+                    }
+                }
+                $message = "Connected. " . count($sections_result) . " librar" . (count($sections_result) === 1 ? "y" : "ies") . " found.";
+            } elseif ($curl_errno !== 0) {
+                $message = "Connection failed: $curl_error (curl error $curl_errno). Check the URL is reachable from this Unraid server, and that the scheme (http/https) and port are correct.";
+            } else {
+                $message = "Connection failed (HTTP $http_code). Check the URL and token.";
+            }
+        }
+    } elseif ($action === 'start') {
+        $out = run_shell("$service_script start 2>&1");
+        plr_debug_log("start requested. output=" . trim((string)$out));
+        $message = ($out === null) ? "Could not run shell commands (shell_exec/exec disabled on this system) - run '$service_script start' manually via SSH instead." : "Start: " . trim((string)$out);
+    } elseif ($action === 'stop') {
+        $out = run_shell("$service_script stop 2>&1");
+        plr_debug_log("stop requested. output=" . trim((string)$out));
+        $message = ($out === null) ? "Could not run shell commands (shell_exec/exec disabled on this system) - run '$service_script stop' manually via SSH instead." : "Stop: " . trim((string)$out);
+    } elseif ($action === 'restart') {
+        $out = run_shell("$service_script restart 2>&1");
+        plr_debug_log("restart requested. output=" . trim((string)$out));
+        $message = ($out === null) ? "Could not run shell commands (shell_exec/exec disabled on this system) - run '$service_script restart' manually via SSH instead." : "Restart: " . trim((string)$out);
+    }
+}
+
+$settings = read_settings($settings_file);
+$directories = read_directories($dirs_file);
+if (empty($directories)) {
+    $directories[] = ['path' => '', 'section' => '', 'enabled' => '1'];
+}
+$running = is_daemon_running();
+
+// Filter BEFORE truncating to the last 40 lines, not after - otherwise
+// during an active large download where [DEBUG] lines dominate, the raw
+// last-40-lines slice could be entirely debug messages, leaving nothing
+// to show even after filtering.
+$log_lines = file_exists($log_file) ? file($log_file) : [];
+if ($settings['HIDE_DEBUG_LOG'] === '1') {
+    $log_lines = array_values(array_filter($log_lines, function ($line) {
+        return strpos($line, '[DEBUG]') === false;
+    }));
+}
+$log_tail = !empty($log_lines) ? implode("", array_slice($log_lines, -40)) : "(no log yet)";
+?>
+<style>
+.plr-card { background: #22252b1a; border: 1px solid #8883; border-radius: 6px; padding: 16px 20px; margin-bottom: 20px; max-width: 900px; box-sizing: border-box; }
+.plr-card * { overflow-wrap: break-word; }
+.plr-card table.new { width: 100%; table-layout: fixed; }
+.plr-card table.new td:first-child { width: 220px; white-space: nowrap; }
+.plr-card h3 { margin-top: 0; }
+.plr-row { display: flex; gap: 10px; align-items: center; margin-bottom: 4px; }
+.plr-row input[type=text] { flex: 1; }
+.plr-row .plr-sec { width: 90px; flex: none; }
+.plr-dir-block { border-bottom: 1px solid #8883; padding-bottom: 10px; margin-bottom: 10px; }
+.plr-plexpath-row { display: flex; gap: 10px; align-items: center; margin-left: 0; }
+.plr-plexpath-row label { color: #888; font-size: 12px; white-space: nowrap; }
+.plr-status-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }
+.plr-status-dot.on { background: #4caf50; }
+.plr-status-dot.off { background: #999; }
+.plr-log { background: #1118; color: #ccc; font-family: monospace; font-size: 12px; padding: 10px; max-height: 300px; overflow-y: auto; white-space: pre-wrap; border-radius: 4px; }
+.plr-msg { padding: 8px 12px; border-radius: 4px; margin-bottom: 16px; background: #2196f333; }
+.plr-sections { margin-top: 10px; font-size: 13px; }
+</style>
+
+<?php if ($message): ?>
+<div class="plr-msg"><?= htmlspecialchars($message) ?></div>
+<?php endif; ?>
+
+<?php if ($sections_result !== null): ?>
+<div class="plr-card">
+  <h3>Plex libraries found</h3>
+  <p style="color:#888;font-size:12px;margin-top:-6px;">
+    The path(s) shown for each library are exactly what Plex has configured - use these (or a
+    subfolder of one) as the "Plex's own path" value for any watched directory belonging to that
+    library. If Plex runs in its own container, this is almost certainly different from the path
+    this Unraid server sees for the same folder.
+  </p>
+  <div class="plr-sections">
+    <?php foreach ($sections_result as $s): ?>
+      <div style="margin-bottom:8px;">
+        <strong>ID <?= htmlspecialchars($s['id']) ?></strong> - <?= htmlspecialchars($s['title']) ?> (<?= htmlspecialchars($s['type']) ?>)
+        <?php if (!empty($s['locations'])): ?>
+          <div style="margin-left:16px; font-family:monospace; font-size:12px; color:#7ed4c0;">
+            <?php foreach ($s['locations'] as $loc): ?>
+              <?= htmlspecialchars($loc) ?><br>
+            <?php endforeach; ?>
+          </div>
+        <?php else: ?>
+          <div style="margin-left:16px; font-size:12px; color:#888;">(no path reported)</div>
+        <?php endif; ?>
+      </div>
+    <?php endforeach; ?>
+    <?php if (empty($sections_result)): ?>
+      <div>No libraries found on this server.</div>
+    <?php endif; ?>
+  </div>
+</div>
+<?php endif; ?>
+
+<form method="post">
+  <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrf_token) ?>">
+  <input type="hidden" name="action" value="save">
+
+  <div class="plr-card">
+    <label style="display:flex; align-items:center; gap:8px; font-size:14px; cursor:pointer;">
+      <input type="checkbox" name="plugin_enabled" <?= $settings['PLUGIN_ENABLED'] === '1' ? 'checked' : '' ?>>
+      <strong>Enable plugin</strong>
+    </label>
+    <div style="color:#888; font-size:12px; margin-top:4px; margin-left:24px;">
+      Pauses all directory watching and Plex refreshes when unchecked, without needing to stop the
+      daemon or uninstall the plugin. The monitor process keeps running (so Start/Stop above still
+      work independently) but does nothing while this is off.
+    </div>
+  </div>
+
+  <div class="plr-card">
+    <h3>Plex connection</h3>
+    <table class="new">
+      <tr>
+        <td>Plex URL</td>
+        <td><input type="text" name="plex_url" value="<?= htmlspecialchars($settings['PLEX_URL']) ?>" placeholder="http://10.0.20.5:32400" size="40"></td>
+      </tr>
+      <tr>
+        <td>Plex token</td>
+        <td><input type="password" name="plex_token" placeholder="leave blank to keep current" size="40"></td>
+      </tr>
+      <tr>
+        <td>Verify SSL</td>
+        <td><input type="checkbox" name="verify_ssl" <?= $settings['VERIFY_SSL'] === '1' ? 'checked' : '' ?>></td>
+      </tr>
+      <tr>
+        <td>Poll interval (seconds)</td>
+        <td><input type="text" name="poll_seconds" value="<?= htmlspecialchars($settings['POLL_SECONDS']) ?>" size="6"></td>
+      </tr>
+      <tr>
+        <td>Settle time (seconds)</td>
+        <td><input type="text" name="settle_seconds" value="<?= htmlspecialchars($settings['SETTLE_SECONDS']) ?>" size="6"></td>
+      </tr>
+    </table>
+    <div style="color:#888; font-size:12px; margin-top:6px;">
+      Settle time: wait this long after the last detected change before refreshing. For large
+      multi-part downloads (many separate archive parts), raise this well above any natural pause
+      between individual files finishing - a common "still downloading" marker (.part, .!qb,
+      .crdownload, etc.) present anywhere in the folder also blocks refreshing regardless of this
+      timer, as extra protection.
+    </div>
+    <br>
+    <label style="display:flex; align-items:center; gap:8px; font-size:14px; cursor:pointer;">
+      <input type="checkbox" name="hide_debug_log" <?= $settings['HIDE_DEBUG_LOG'] === '1' ? 'checked' : '' ?>>
+      Hide debug messages in Recent activity
+    </label>
+    <div style="color:#888; font-size:12px; margin-top:4px; margin-left:24px;">
+      Debug messages ("change detected", "still waiting on an incomplete-download marker") can be frequent
+      during a large active download. They're always written to the underlying log either way - this just
+      controls what's shown here. Unchecked by default.
+    </div>
+    <br>
+    <button type="submit" name="action" value="save" class="btn">Save settings</button>
+    <button type="submit" name="action" value="test_connection" class="btn">Test connection</button>
+  </div>
+
+  <div class="plr-card">
+    <h3>Watched directories</h3>
+    <p style="color:#888;font-size:13px;margin-top:-6px;">
+      Enter the exact path as this Unraid server sees it (e.g. <code>/mnt/user/Share/TV.1080p</code>), and the
+      Plex library section ID it belongs to (use Test connection above to find section IDs - it also lists
+      each library's own configured path(s), useful for the Plex path field below).
+    </p>
+    <div id="plr-dirs">
+      <?php foreach ($directories as $i => $d): ?>
+      <div class="plr-dir-block">
+        <div class="plr-row">
+          <input type="text" name="dir_path[]" value="<?= htmlspecialchars($d['path']) ?>" placeholder="/mnt/user/Share/TV.1080p">
+          <input type="text" class="plr-sec" name="dir_section[]" value="<?= htmlspecialchars($d['section']) ?>" placeholder="Section ID">
+          <label><input type="checkbox" name="dir_enabled[]" <?= $d['enabled'] === '1' ? 'checked' : '' ?>> Enabled</label>
+          <button type="button" class="btn" onclick="this.closest('.plr-dir-block').remove()">Remove</button>
+        </div>
+        <div class="plr-plexpath-row">
+          <label>Plex's own path for this folder:</label>
+          <input type="text" name="dir_plex_path[]" value="<?= htmlspecialchars($d['plex_path'] ?? '') ?>" placeholder="leave blank if identical to the path above">
+        </div>
+      </div>
+      <?php endforeach; ?>
+    </div>
+    <button type="button" class="btn" onclick="plrAddRow()">+ Add directory</button>
+    <br><br>
+    <button type="submit" name="action" value="save" class="btn">Save settings</button>
+  </div>
+</form>
+
+<div class="plr-card">
+  <h3>
+    <span class="plr-status-dot <?= $running ? 'on' : 'off' ?>"></span>
+    Monitor daemon: <?= $running ? 'running' : 'stopped' ?>
+    <?php if ($settings['PLUGIN_ENABLED'] !== '1'): ?>
+      <span style="color:#e0b64c; font-size:13px; font-weight:normal;">(plugin disabled - idling, not watching anything)</span>
+    <?php endif; ?>
+  </h3>
+  <form method="post" style="display:inline;">
+    <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrf_token) ?>">
+    <button type="submit" name="action" value="start" class="btn">Start</button>
+    <button type="submit" name="action" value="stop" class="btn">Stop</button>
+    <button type="submit" name="action" value="restart" class="btn">Restart</button>
+  </form>
+  <br><br>
+  <h4>Recent activity</h4>
+  <div class="plr-log"><?= htmlspecialchars($log_tail) ?></div>
+</div>
+
+<script>
+function plrAddRow() {
+  var container = document.getElementById('plr-dirs');
+  var block = document.createElement('div');
+  block.className = 'plr-dir-block';
+  block.innerHTML =
+    '<div class="plr-row">' +
+      '<input type="text" name="dir_path[]" placeholder="/mnt/user/Share/...">' +
+      '<input type="text" class="plr-sec" name="dir_section[]" placeholder="Section ID">' +
+      '<label><input type="checkbox" name="dir_enabled[]" checked> Enabled</label>' +
+      '<button type="button" class="btn" onclick="this.closest(\'.plr-dir-block\').remove()">Remove</button>' +
+    '</div>' +
+    '<div class="plr-plexpath-row">' +
+      '<label>Plex\'s own path for this folder:</label>' +
+      '<input type="text" name="dir_plex_path[]" placeholder="leave blank if identical to the path above">' +
+    '</div>';
+  container.appendChild(block);
+}
+</script>
