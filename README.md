@@ -4,8 +4,6 @@ Watches a set of directories you choose, and when files inside them settle
 after a change (something added or removed), triggers a scoped Plex
 library refresh for that directory - no full-library rescan.
 
-This is a **native Unraid plugin**, not a Docker container: it installs
-directly into Unraid's OS and shows up under Settings in the webGUI.
 
 > **Note on testing:** individual pieces (the monitor daemon's
 > change-detection/debounce logic, the settings page's save/load handling,
